@@ -2384,9 +2384,16 @@ def _update_preflight_handled(args) -> bool:
         record_refusal_receipt(refusal)
         sys.exit(2)
 
-    if getattr(args, "check", False):
-        # --check honors --branch so its answer matches what update would pull.
+    from hermes_cli.update_channel import UpdateChannelError
+
+    try:
         branch = _resolve_update_branch(args)
+    except UpdateChannelError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    if getattr(args, "check", False):
+        # --check and apply use the same explicit or persistent selection.
         from hermes_cli.update_cmd import _cmd_update_check
 
         _cmd_update_check(
@@ -2394,6 +2401,8 @@ def _update_preflight_handled(args) -> bool:
             branch_explicit=bool(getattr(args, "branch", None)),
         )
         return True
+    # Pin this run before backups/pauses and carry the selection across re-exec.
+    args.branch = branch
     return False
 
 

@@ -78,7 +78,8 @@ def test_cache_is_daily_but_invalidated_when_head_moves(git_repo, monkeypatch):
 
     def write_cache(*, ts, head, behind):
         cache_file.write_text(json.dumps(
-            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head}))
+            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head,
+             "branch": "main", "origin": "https://github.com/NousResearch/hermes-agent.git"}))
 
     write_cache(ts=time.time() - banner._UPDATE_CHECK_CACHE_SECONDS + 60, head=SHA_A, behind=3)
     assert banner.check_for_updates() == 3

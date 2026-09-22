@@ -43,6 +43,13 @@ test('cache serves a passive check for 24h, but not once HEAD or the branch chan
   const failed = { ...cached, status: { error: 'fetch-failed' } }
   assert.equal(cacheIsFresh(failed, { branch: 'main', currentSha: SHA_A, now: UPDATE_CHECK_FAILURE_TTL_MS - 1 }), true)
   assert.equal(cacheIsFresh(failed, { branch: 'main', currentSha: SHA_A, now: 2 * HOUR }), false)
+  // Enrolling a fork must not reuse an answer from the previous origin.
+  const fork = { ...cached, originUrl: 'https://github.com/owner/fork.git' }
+  assert.equal(cacheIsFresh(fork, { branch: 'main', currentSha: SHA_A, now: 1, originUrl: fork.originUrl }), true)
+  assert.equal(
+    cacheIsFresh(fork, { branch: 'main', currentSha: SHA_A, now: 1, originUrl: 'https://github.com/other/fork.git' }),
+    false
+  )
 })
 
 test('compare payload maps to the behind count and a newest-first commit list; malformed = null', () => {

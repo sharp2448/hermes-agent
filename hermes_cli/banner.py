@@ -224,19 +224,19 @@ def _is_full_sha(value: Optional[str]) -> bool:
 _compare_payload_cache: Dict[tuple, dict] = {}
 
 
-def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
+def _github_compare(current_rev: str, target_rev: str, repo_slug: Optional[str] = "nousresearch/hermes-agent") -> Optional[dict]:
     """Compare payload for ``current...target`` from the GitHub API; memoized per process.
 
     Shallow installer clones and API-only probes know the two tip SHAs but have no local history
     to run ``rev-list --count`` or ``git log`` across; the payload carries both the count
     (``ahead_by``) and the commit list the dashboard/desktop render as "what's changed".
     """
-    if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
+    if not repo_slug or not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
-    key = (current_rev, target_rev)
+    key = (repo_slug, current_rev, target_rev)
     if key in _compare_payload_cache:
         return _compare_payload_cache[key]
-    url = f"https://api.github.com/repos/nousresearch/hermes-agent/compare/{current_rev}...{target_rev}"
+    url = f"https://api.github.com/repos/{repo_slug}/compare/{current_rev}...{target_rev}"
 
     def _fetch():
         import urllib.request
@@ -252,9 +252,9 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     return payload
 
 
-def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
-    """Exact behind-count via the GitHub compare API for uncountable graphs."""
-    payload = _github_compare(current_rev, target_rev)
+def _github_compare_behind(current_rev: str, target_rev: str, repo_slug: Optional[str] = "nousresearch/hermes-agent") -> Optional[int]:
+    """Exact behind-count via the selected repository, not the official repo for forks."""
+    payload = _github_compare(current_rev, target_rev, repo_slug)
     ahead = payload.get("ahead_by") if payload else None
     return ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
 
@@ -269,7 +269,7 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     head_rev, target_rev = cached.get("head"), cached.get("target")
     if not head_rev or not target_rev or head_rev == target_rev:
         return []
-    payload = _github_compare(head_rev, target_rev)
+    payload = _github_compare(head_rev, target_rev, cached.get("repo", "nousresearch/hermes-agent"))
     rows: List[Dict[str, Any]] = []
     for entry in (payload or {}).get("commits", []) if isinstance(payload, dict) else []:
         commit = entry.get("commit") or {}
@@ -289,7 +289,8 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     return rows[:n]
 
 
-def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: Optional[Path] = None) -> Optional[int]:
+def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: Optional[Path] = None,
+                 repo_slug: Optional[str] = "nousresearch/hermes-agent") -> Optional[int]:
     """Behind-count from two tip SHAs: None if either is unknown, 0 when equal, else count/sentinel.
 
     With ``repo_dir``, a target that is already an ancestor of HEAD (local-ahead checkout) is 0 too.
@@ -302,7 +303,8 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
     if head_rev == target_rev or (repo_dir is not None and _git_ok(
             ["merge-base", "--is-ancestor", target_rev, "HEAD"], cwd=repo_dir)):
         return 0
-    counted = _github_compare_behind(head_rev, target_rev)
+    counted = (_github_compare_behind(head_rev, target_rev) if repo_slug == "nousresearch/hermes-agent"
+               else _github_compare_behind(head_rev, target_rev, repo_slug))
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
@@ -318,7 +320,19 @@ def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
             url, headers={"Accept": "application/vnd.github.sha", "User-Agent": "hermes-cli-update-check"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8").strip()
-    sha = _quiet(_fetch)
+    from urllib.error import HTTPError
+    from hermes_cli.update_channel import UpdateChannelError
+
+    try:
+        sha = _fetch()
+    except HTTPError as exc:
+        if branch != "main" and exc.code in {404, 422}:
+            raise UpdateChannelError(
+                f"Cannot find selected update branch {branch!r} on {repo_slug}; "
+                "verify origin and updates.json. Channel unchanged.") from exc
+        return None
+    except Exception:
+        return None
     return sha if _is_full_sha(sha) else None
 
 
@@ -340,8 +354,8 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return _tips_behind(local_rev, _last_target_rev)
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout.
+def _check_via_local_git(repo_dir: Path, branch: Optional[str] = None) -> Optional[int]:
+    """Count commits behind the selected origin branch in a local checkout.
 
     Passive checks never run ``git fetch``: every CLI/TUI/gateway start used to negotiate a pack
     with GitHub, and across the install base that was tens of millions of fetch requests a day
@@ -349,6 +363,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     API, the local one from ``rev-parse`` — and ``_tips_behind`` recovers the exact count through
     the compare API when they differ. ``git fetch`` happens only inside ``hermes update``.
     """
+    from hermes_cli.update_channel import resolve_update_branch, UpdateChannelError
+
+    branch = branch or resolve_update_branch()
     # Probe the origin URL under the config-isolated env: a global url.<https>.insteadOf rewrite
     # otherwise makes an SSH origin masquerade as HTTPS (#104591).
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True)
@@ -357,17 +374,20 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         return None
     canonical = _canonical_github_remote(origin_url)
     if canonical.startswith("github.com/"):
-        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), "main")
+        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), branch)
     else:
         # Non-GitHub origin: one ls-remote for the tip (ref advertisement only, no pack transfer).
-        result = _git_run(["ls-remote", "origin", "refs/heads/main"], cwd=repo_dir, timeout=10, network=True)
+        result = _git_run(["ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"], cwd=repo_dir, timeout=10, network=True)
+        if result is not None and result.returncode == 2:
+            raise UpdateChannelError(f"Selected update branch {branch!r} is missing on origin; update channel unchanged.")
         target_rev = result.stdout.split()[0] if result is not None and result.returncode == 0 and result.stdout else None
     global _last_target_rev
     _last_target_rev = target_rev
     # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/main, and
     # misreporting an ahead checkout nudges the user into `hermes update`, which can wipe carried
     # work — hence the ancestor check inside _tips_behind, against the FRESH upstream SHA.
-    return _tips_behind(head_rev, target_rev, repo_dir)
+    slug = canonical.removeprefix("github.com/") if canonical.startswith("github.com/") else None
+    return _tips_behind(head_rev, target_rev, repo_dir, slug)
 
 
 def _read_json(path: Path) -> Optional[dict]:
@@ -406,9 +426,15 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     now = time.time()
     repo_dir = None if embedded_rev else _resolve_repo_dir()
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir) if repo_dir is not None else None
+    from hermes_cli.update_channel import resolve_update_branch
+
+    branch = resolve_update_branch() if repo_dir is not None else "main"
+    origin = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True) if repo_dir is not None else None
+    canonical = _canonical_github_remote(origin)
+    slug = (canonical.removeprefix("github.com/") if canonical.startswith("github.com/") else None) if repo_dir else "nousresearch/hermes-agent"
     cached = _read_json(cache_file)
     if cached is not None and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION \
-            and cached.get("head") == head_rev:
+            and cached.get("head") == head_rev and cached.get("branch") == branch and cached.get("origin") == origin:
         ttl = _UPDATE_CHECK_CACHE_SECONDS if cached.get("behind") is not None else _UPDATE_CHECK_FAILURE_CACHE_SECONDS
         if now - cached.get("ts", 0) < ttl:
             return cached.get("behind")
@@ -416,10 +442,11 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
         behind = _check_via_rev(embedded_rev)
     else:
         # No checkout and no embedded revision — status can't be determined.
-        behind = _check_via_local_git(repo_dir) if repo_dir is not None else None
+        behind = _check_via_local_git(repo_dir, branch) if repo_dir is not None else None
     _quiet(lambda: cache_file.write_text(
         json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION,
-                    "head": head_rev or embedded_rev, "target": _last_target_rev}),
+                    "head": head_rev or embedded_rev, "target": _last_target_rev,
+                    "branch": branch, "origin": origin, "repo": slug}),
         encoding="utf-8"))
     return behind
 

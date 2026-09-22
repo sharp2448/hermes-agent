@@ -460,9 +460,13 @@ import {
   resolveBehindLocally
 } from './update-api-check'
 import { updateCheckAgent } from './update-api-proxy'
+import {
+  readDesktopUpdateConfig as readUpdateConfig,
+  resolveDesktopUpdateBranch,
+  validateUpdateBranch
+} from './update-channel'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
   describeUpdaterHandoffFailure,
@@ -3144,14 +3148,7 @@ function recentHermesLog() {
 // ─── Self-update (git-pull against the running backend's hermes root) ──────
 
 function readDesktopUpdateConfig() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
-    const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
-
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
-  } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
-  }
+  return readUpdateConfig(DESKTOP_UPDATE_CONFIG_PATH)
 }
 
 // Atomic file write: temp + rename (atomic on all platforms). Prevents
@@ -3297,33 +3294,8 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Self-heal the tracked update branch: if origin no longer publishes it (e.g.
-// bb/gui was merged into main and deleted), fall back to main and persist so
-// every later check/apply follows main — no manual flip, even for already-
-// installed clients. Read-only ls-remote probe; only flips on a definitive
-// "ref absent" (exit 2), never on a transient network error, so a flaky
-// connection can't strand a user on the wrong branch.
-async function resolveHealedBranch(updateRoot, branch) {
-  if (!branch || branch === 'main') {
-    return branch || 'main'
-  }
-
-  const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
-
-  if (probe.code !== 2) {
-    return branch
-  }
-
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
-  const config = readDesktopUpdateConfig()
-
-  if (config.branch !== 'main') {
-    writeDesktopUpdateConfig({ ...config, branch: 'main' })
-  }
-
-  return 'main'
+function resolveSelectedUpdateBranch(updateRoot: string) {
+  return resolveDesktopUpdateBranch(DESKTOP_UPDATE_CONFIG_PATH, updateRoot, runGit)
 }
 
 // Passive checks never touch git's network side. Every client used to `git
@@ -3363,11 +3335,11 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
   const cached = readUpdateCheckCache()
   const now = Date.now()
 
-  if (!force && cacheIsFresh(cached, { branch, currentSha, now })) {
+  if (!force && cacheIsFresh(cached, { branch, currentSha, now, originUrl })) {
     return { ...cached.status, dirty: dirtyStr.length > 0, currentBranch }
   }
 
-  branch = await resolveHealedBranch(updateRoot, branch)
+  branch = await resolveSelectedUpdateBranch(updateRoot)
   const slug = githubRepoSlug(originUrl)
 
   const status = slug
@@ -3385,7 +3357,7 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
     ...status
   }
 
-  writeUpdateCheckCache({ fetchedAt: now, currentSha, branch, status: result })
+  writeUpdateCheckCache({ fetchedAt: now, currentSha, branch, originUrl, status: result })
 
   return result
 }
@@ -4213,29 +4185,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       const updateRoot = resolveUpdateRoot()
 
       if (!resolveUpdateScriptHandoff(updateRoot)) {
-        // They DO have a working `hermes` on PATH / in the venv, so the
-        // correct path is the one-liner in their native medium. We show the
-        // EXACT command, branch-pinned to the checkout they're on — bare
-        // `hermes update` defaults to main and would silently switch a
-        // bb/gui (or any non-main) install off-branch. Mirror the GUI
-        // button's contract: append --branch <current> for non-main
-        // checkouts, keep it bare for main so the card stays clean.
-        let command = 'hermes update'
-
-        try {
-          const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-          const current = (head.stdout || '').trim()
-
-          if (head.code === 0 && current && current !== 'HEAD') {
-            const branch = await resolveHealedBranch(updateRoot, current)
-
-            if (branch !== 'main') {
-              command = `hermes update --branch ${branch}`
-            }
-          }
-        } catch {
-          // Best-effort: fall back to bare `hermes update` if branch detection fails.
-        }
+        const branch = await resolveSelectedUpdateBranch(updateRoot)
+        const command = branch === 'main' ? 'hermes update' : `hermes update --branch ${branch}`
 
         rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
         emitUpdateProgress({ stage: 'manual', message: command, percent: null })
@@ -4268,8 +4219,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
-    const { branch: configuredBranch } = readDesktopUpdateConfig()
-    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    const branch = await resolveSelectedUpdateBranch(updateRoot)
     const updaterArgs = ['--update', '--branch', branch]
     const targetApp = IS_MAC ? runningAppBundle() : null
 
@@ -4577,7 +4527,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const { branch: configuredBranch } = readDesktopUpdateConfig()
 
   const branch = directoryExists(path.join(updateRoot, '.git'))
-    ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    ? await resolveSelectedUpdateBranch(updateRoot)
     : configuredBranch || DEFAULT_UPDATE_BRANCH
 
   const venvBin = path.join(resolveVenvDir(updateRoot), IS_WINDOWS ? 'Scripts' : 'bin')
@@ -4778,12 +4728,14 @@ async function preflightStateDb(hermesHome, rememberLog) {
 // to leave. Checkouts that predate the script get the manual card once.
 async function applyUpdatesPosixHandoff(opts: any) {
   const updateRoot = resolveUpdateRoot()
+  const branch = await resolveSelectedUpdateBranch(updateRoot)
   const handoff = resolvePosixScriptHandoff(updateRoot)
 
   if (!handoff) {
-    emitUpdateProgress({ stage: 'manual', message: 'hermes update', percent: null })
+    const command = branch === 'main' ? 'hermes update' : `hermes update --branch ${branch}`
+    emitUpdateProgress({ stage: 'manual', message: command, percent: null })
 
-    return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
+    return { ok: true, manual: true, command, hermesRoot: updateRoot }
   }
 
   const handoffConflict = updateHandoffConflict(HERMES_HOME)
@@ -4799,21 +4751,6 @@ async function applyUpdatesPosixHandoff(opts: any) {
 
   // ── Pre-flight state.db integrity guard (#68474) ──
   await preflightStateDb(HERMES_HOME, rememberLog)
-
-  // Branch-pin so a non-main checkout doesn't get switched to main (and
-  // self-heal to main when the pinned branch no longer exists on origin).
-  let branch = 'main'
-
-  try {
-    const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-    const current = (head.stdout || '').trim()
-
-    if (head.code === 0 && current && current !== 'HEAD') {
-      branch = await resolveHealedBranch(updateRoot, current)
-    }
-  } catch {
-    // best effort
-  }
 
   const args = [...handoff.args, '--install-root', updateRoot, '--branch', branch, '--desktop-pid', String(process.pid)]
 
@@ -18111,7 +18048,6 @@ const disposeTerminalSession = terminalIpc.disposeTerminalSession
 ipcMain.handle('hermes:updates:check', async (_event, opts) =>
   checkUpdates({ force: Boolean(opts?.force) }).catch(error => ({
     supported: true,
-    branch: readDesktopUpdateConfig().branch,
     error: error?.kind === GIT_UNUSABLE ? GIT_UNUSABLE : 'check-failed',
     message: error?.message || String(error),
     fetchedAt: Date.now()
@@ -18129,8 +18065,8 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
-  const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
-  writeDesktopUpdateConfig({ branch })
+  const branch = validateUpdateBranch(name, DESKTOP_UPDATE_CONFIG_PATH)
+  writeDesktopUpdateConfig({ ...readDesktopUpdateConfig(), branch })
 
   return { branch }
 })

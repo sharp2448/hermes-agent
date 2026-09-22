@@ -25,6 +25,7 @@ export interface CachedUpdateCheck {
   fetchedAt: number
   currentSha: string
   branch: string
+  originUrl?: string
   status: Record<string, unknown> & { error?: string }
 }
 
@@ -52,9 +53,9 @@ export function compareApiUrl(slug: string, currentSha: string, targetSha: strin
  */
 export function cacheIsFresh(
   cached: CachedUpdateCheck | null | undefined,
-  { branch, currentSha, now }: { branch: string; currentSha: string; now: number }
+  { branch, currentSha, now, originUrl }: { branch: string; currentSha: string; now: number; originUrl?: string }
 ): boolean {
-  if (!cached || cached.branch !== branch || cached.currentSha !== currentSha) {
+  if (!cached || cached.branch !== branch || cached.currentSha !== currentSha || cached.originUrl !== originUrl) {
     return false
   }
 

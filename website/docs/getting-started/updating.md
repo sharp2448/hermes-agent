@@ -14,7 +14,7 @@ Update to the latest version with a single command:
 hermes update
 ```
 
-This pulls the latest code from `main`, updates dependencies, and prompts you to configure any new options that were added since your last update.
+This pulls the latest code from your enrolled update branch (`main` when unconfigured), updates dependencies, and prompts you to configure any new options that were added since your last update.
 
 :::tip
 `hermes update` automatically detects new configuration options and prompts you to add them. If you skipped that prompt, you can manually run `hermes config check` to see missing options, then `hermes config migrate` to interactively add them.
@@ -35,7 +35,7 @@ This suppresses both cached update notices and passive update-check network requ
 When you run `hermes update`, the following steps occur:
 
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Because the code swap and gateway restarts touch every profile, the same snapshot is taken for **every profile** on the install — each into its own `state-snapshots/` directory — and the post-update cron-jobs safety net checks each profile against its own snapshot. Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md). Quick snapshots are file-loss recovery, not code-rollback insurance — for a coherent point-in-time rollback use `--backup` (full mode). The snapshot is best-effort: if it fails, the update prints a `⚠ Pre-update snapshot FAILED` warning and continues, and the receipt records `pre_update_backup` as a failed step (a deliberate `off`/`--no-backup` lands in the receipt's skips with its reason instead).
-2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
+2. **Git pull** — pulls the latest code from the selected branch (`main` when unconfigured) and updates submodules
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
    After this point the updater re-executes itself on the freshly pulled code (`update.log` shows `=== hermes update continued on the pulled code ===`), so the remaining steps never mix old and new modules in one process. If you see two `hermes update` processes for a moment, that is the hand-off.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies. When the checkout is already current this step still runs if the venv is unhealthy (core imports fail) **or** if its installed `hermes-agent` distribution is from an older release than the checkout — the sign that a previous run's dependency install was refused or interrupted (`⚠ Checkout is current, but its dependencies were never synced after the last pull`), so `✓ Already up to date!` never hides a half-updated environment.
@@ -68,7 +68,7 @@ On Windows, a Desktop reopened during packaging is stopped again immediately bef
 
 ### Updating against a non-default branch: `--branch`
 
-By default `hermes update` tracks `origin/main`. Pass `--branch <name>` to update against a different branch — useful for QA channels, feature branches, or release-candidate testing:
+Without an enrolled channel, `hermes update` tracks `origin/main`. Pass `--branch <name>` to override the persistent selection for one run — useful for QA channels, feature branches, or release-candidate testing:
 
 ```bash
 hermes update --branch release-candidate
@@ -76,6 +76,72 @@ hermes update --check --branch experimental   # preview behindness only
 ```
 
 If your local checkout is on a different branch, Hermes auto-stashes any uncommitted work, switches HEAD to the target branch, and then pulls. Branches that don't exist locally are auto-tracked from `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches that don't exist anywhere fail cleanly — your stashed changes are restored before exit so you're never stranded in a weird state. The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
+
+### Persistent channels for Desktop and remote backends
+
+For Git installs, the ordinary **Update Hermes** button, bare `hermes update`,
+`hermes update --check`, and backend update checks share the target user's
+Desktop `updates.json` selection. Precedence is:
+
+1. Explicit CLI `--branch NAME` (one run; does not rewrite the file).
+2. `branch` in that machine/user's Desktop `updates.json`.
+3. `main` only when the file or `branch` key is absent.
+
+The file is **per OS user, not per Hermes profile**. Its location is the existing
+`HERMES_DESKTOP_USER_DATA_DIR/updates.json` override when set; otherwise:
+
+| Host | File |
+| --- | --- |
+| Linux | `$XDG_CONFIG_HOME/Hermes/updates.json`, or `~/.config/Hermes/updates.json` |
+| macOS | `~/Library/Application Support/Hermes/updates.json` |
+| Windows | `%APPDATA%\Hermes\updates.json` |
+
+Use the same user-data override for a custom Desktop launcher and its CLI.
+A backend without Desktop installed can use the same file. For a service,
+enroll the **service account's** file, under the environment that service uses.
+Remote URL/API and Desktop-managed SSH updates use the **remote target's own**
+selection; the client's channel is never forwarded to retarget another machine.
+Every target needs this updater fix installed once before its normal button can
+honor the enrollment. Cloud/image/package-managed admission guards still apply.
+
+For example, enroll `stable` once from the checkout, using its Python environment
+(the snippet preserves unrelated keys and fails if the existing JSON is invalid):
+
+```python
+import json
+from hermes_cli.update_channel import update_config_path
+
+path = update_config_path()
+config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+config["branch"] = "stable"
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_name(path.name + ".tmp")
+temporary.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+temporary.replace(path)
+print(path, path.read_text(encoding="utf-8"))
+```
+
+The channel does not select a repository. Set the intended fork as `origin`
+and ensure its selected branch has a tracking-ref fetch mapping:
+
+```bash
+git remote set-url origin https://github.com/YOUR-ACCOUNT/hermes-agent.git
+git config --get-all remote.origin.fetch
+# Only if stable is not covered by an existing exact or wildcard mapping:
+git config --local --add remote.origin.fetch '+refs/heads/stable:refs/remotes/origin/stable'
+hermes update --check
+```
+
+Keep existing fetch mappings; stop and resolve conflicting/negative mappings
+rather than replacing them. These commands do not move HEAD. Once enrolled,
+advance the fork's `stable` branch and use the ordinary Update Hermes button.
+The current checkout branch does not override the enrolled channel.
+
+Malformed/unreadable channel files, invalid branch values, and a missing selected
+branch fail visibly; Hermes does **not** rewrite the choice or switch to `main`.
+Restore the branch or explicitly repair/change the selection before retrying.
+Windows' Git-failure ZIP recovery still refuses custom branches; repair Git
+rather than using an official `main` archive as a substitute for your fork.
 
 ### Checkout parked on a feature branch
 

@@ -243,6 +243,14 @@ async def update_hermes():
             response["action_id"] = action_id
         return response
 
+    # Only the target's persistent choice is authoritative; no caller-supplied branch.
+    from hermes_cli.update_channel import resolve_update_branch, UpdateChannelError
+
+    try:
+        resolve_update_branch()
+    except UpdateChannelError as exc:
+        return _update_refused("update_channel_invalid", str(exc), "repair updates.json")
+
     action_id = secrets.token_hex(16)
     with http_failure("Failed to spawn hermes update", 500, "Failed to start update"):
         proc = _spawn_hermes_action(["update"], "hermes-update", env_overrides={"HERMES_ACTION_ID": action_id})
@@ -284,6 +292,8 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
         payload["message"] = non_applyable()
         return payload
 
+    from hermes_cli.update_channel import UpdateChannelError
+
     # banner.check_for_updates() handles git / nix-revision paths through the GitHub API and
     # caches the result for 24h. ``force`` busts the cache so "Check now" reflects reality.
     try:
@@ -295,6 +305,9 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
             with contextlib.suppress(OSError), _config_profile_scope(profile):
                 (get_hermes_home() / ".update_check").unlink()
         behind = await asyncio.to_thread(check_for_updates)
+    except UpdateChannelError as exc:
+        payload.update(can_apply=False, error="update_channel_invalid", message=str(exc))
+        return payload
     except Exception:
         _log.exception("Update check failed")
         behind = None
