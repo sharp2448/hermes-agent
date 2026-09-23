@@ -113,6 +113,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Plugin-owned SDKs mirror the range their plugin.yaml declares instead of an exact pin: an exact pin
     # made _is_satisfied() reject every newer compatible release, so `hermes update` kept downgrading a
     # working newer client and broke daemons whose DB it had migrated (#86992, #39424, #98407).
+    "memory.hindsight": ("hindsight-client>=0.6.1,<1",),
     "memory.mem0": ("mem0ai>=2.0.10,<3",),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
