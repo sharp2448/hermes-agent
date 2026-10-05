@@ -53,15 +53,12 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
 def _ensure_client_dependency() -> None:
-    """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
+    """Request the locked client-only extra through PM's policy and admission path."""
+    import pm
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("memory.hindsight", prompt=False)
-    except ImportError:
-        pass
-    except Exception as exc:
+        pm.ensure_import("hindsight")
+    except pm.InstallError as exc:
         raise ImportError(str(exc)) from exc
-
 
 def _scoped_setting(name: str, default: str = "") -> str:
     """Profile-scoped read of a retain SHAPING value, with the provider's own default on a miss.
@@ -92,28 +89,21 @@ def _cloud_api_key(config: dict) -> str:
 
 
 def _maybe_upgrade_client() -> None:
-    """Auto-upgrade an outdated hindsight-client via the environment-aware lazy_deps
-    installer (sealed hosted venvs redirect to the durable target)."""
-    try:
-        from importlib.metadata import version as pkg_version
-        from packaging.version import Version
-        installed = pkg_version("hindsight-client")
-        if Version(installed) < Version(_MIN_CLIENT_VERSION):
-            logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                           installed, _MIN_CLIENT_VERSION)
-            from tools.lazy_deps import install_specs
-            outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-            if outcome.ok:
-                logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-            elif outcome.blocked:
-                logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               outcome.reason, _MIN_CLIENT_VERSION)
-            else:
-                logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
-    except Exception:
-        pass  # packaging not available or other issue — proceed anyway
+    """Recover an old client through the locked extra, never an unbounded SDK upgrade."""
+    from importlib.metadata import version, PackageNotFoundError
+    from packaging.version import Version
+    import pm
 
+    try:
+        installed = version("hindsight-client")
+    except PackageNotFoundError:
+        return  # _ensure_client_dependency owns the missing-client path.
+    if Version(installed) < Version(_MIN_CLIENT_VERSION):
+        try:
+            pm.sync_venv(["hindsight"])
+        except pm.InstallError as exc:
+            raise ImportError(str(exc)) from exc
+        raise ImportError("Hindsight client prepared by PM; restart Hermes to activate it.")
 
 # update_mode='append' capability (Hindsight >= 0.5.0), cached per (API URL, key fingerprint)
 # per process so every provider on the same API+key shares one /version round trip. A failed probe

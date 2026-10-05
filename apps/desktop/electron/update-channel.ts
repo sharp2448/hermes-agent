@@ -1,9 +1,9 @@
 import fs from 'node:fs'
 
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import { execGit } from './no-console-git'
 
 interface GitResult {
-  code: number
+  code: number | null
   stdout: string
   stderr: string
 }
@@ -29,15 +29,15 @@ export function validateUpdateBranch(branch: unknown, source: string): string {
   return branch
 }
 
-export function readDesktopUpdateConfig(configPath: string): { branch: string } {
+export function readDesktopUpdateConfig(configPath: string): { branch: string; branchExplicit: boolean } {
   let parsed: unknown
 
   try {
-    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(configPath))
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(configPath))
     parsed = JSON.parse(text)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !fs.lstatSync(configPath, { throwIfNoEntry: false })) {
-      return { branch: 'main' }
+      return { branch: 'main', branchExplicit: false }
     }
 
     throw new Error(`Cannot read update channel ${configPath}: ${error}`)
@@ -49,29 +49,40 @@ export function readDesktopUpdateConfig(configPath: string): { branch: string } 
 
   const config = parsed as Record<string, unknown>
 
-  return { ...config, branch: validateUpdateBranch('branch' in config ? config.branch : 'main', configPath) }
+  return {
+    ...config,
+    branch: validateUpdateBranch('branch' in config ? config.branch : 'main', configPath),
+    branchExplicit: 'branch' in config
+  }
 }
 
 /** Check and handoff use the same enrolled channel, never the checkout's HEAD. */
 export async function resolveDesktopUpdateBranch(
   configPath: string,
   updateRoot: string,
-  runGit: RunGit
+  git: RunGit | string
 ): Promise<string> {
-  const { branch } = readDesktopUpdateConfig(configPath)
+  const { branch, branchExplicit } = readDesktopUpdateConfig(configPath)
 
-  if (branch === 'main') {
+  if (!branchExplicit) {
     return branch
   }
 
-  const origin = await runGit(['remote', 'get-url', 'origin'], { cwd: updateRoot })
-  const remote = isOfficialSshRemote(origin.stdout.trim()) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${branch}`], {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never' }
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_NAMESPACE']) {
+    delete env[key]
+  }
+  const runGit: RunGit =
+    typeof git === 'string' ? (args, options) => execGit(git, args, { ...options, env, timeoutMs: 30000 }) : git
+  const probe = await runGit(['ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`], {
     cwd: updateRoot
   })
 
-  if (probe.code === 2) {
+  const advertised = probe.stdout.split('\n').some(line => {
+    const [sha, ref] = line.trim().split(/\s+/)
+    return /^[0-9a-f]{40}$/i.test(sha || '') && ref === `refs/heads/${branch}`
+  })
+  if (probe.code === 2 || (probe.code === 0 && !advertised)) {
     throw new Error(
       `Selected update branch '${branch}' is missing on origin; channel unchanged. Restore it or change ${configPath}.`
     )

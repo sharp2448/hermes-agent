@@ -10,9 +10,13 @@ including append-buffer trimming and no duplicate flush on session switch.
 Bundled-first discovery makes the generic provider-presence check skip catalog
 migration; no migration special case is needed. Existing `local_external` settings
 and the separately supervised daemon are unchanged. The restored optional extra
-and lazy dependency entry install only `hindsight-client`, not `hindsight-all` or
+and PM admission install only pinned `hindsight-client==0.6.1`, not `hindsight-all` or
 the server stack, preserving Hermes' MCP 2 dependency isolation. The old
 core-side embedded-runtime dependency expansion is deliberately not restored.
+PM preserves the client across legacy-venv takeover and later generations, and
+admits it when a live profile selects the bundled provider. Nonusers and default
+bundles do not acquire it. The setup wizard refuses embedded-server installation;
+use `local_external` with a separately managed daemon.
 Remove this carry only after the catalog replacement passes the same regression
 checks; do not migrate a live bank to test it.
 
@@ -28,7 +32,7 @@ checks; do not migrate a live bank to test it.
 hermes memory setup    # select "hindsight"
 ```
 
-The setup wizard installs dependencies automatically via `uv`, walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank.
+The setup wizard prepares the locked client-only extra through PM (`hermes pm install --extra hindsight`), walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank.
 
 Or manually (cloud mode with defaults):
 ```bash

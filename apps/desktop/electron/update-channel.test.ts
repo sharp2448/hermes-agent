@@ -78,15 +78,34 @@ test('Desktop check and handoff follow enrollment, never checkout HEAD or a fall
   const policy = '{"branch":"stable","other":"keep"}'
   fs.writeFileSync(config, policy)
   expect(git(repo, 'branch', '--show-current')).toBe('main')
-  expect(await resolveDesktopUpdateBranch(config, repo, runGit)).toBe('stable')
+  expect(await resolveDesktopUpdateBranch(config, repo, 'git')).toBe('stable')
   git(remote, 'branch', '-D', 'stable')
   // refs/heads/other/stable must not satisfy a missing refs/heads/stable.
   git(remote, 'branch', 'other/stable')
+  git(remote, 'branch', 'other/refs/heads/stable')
   await expect(resolveDesktopUpdateBranch(config, repo, runGit)).rejects.toThrow(/stable.*missing/i)
   expect(fs.readFileSync(config, 'utf8')).toBe(policy)
   git(repo, 'remote', 'set-url', 'origin', path.join(remote, 'gone'))
   await expect(resolveDesktopUpdateBranch(config, repo, runGit)).rejects.toThrow(/verify.*stable/i)
   expect(fs.readFileSync(config, 'utf8')).toBe(policy)
+})
+
+test('enrolled main refuses a deleted remote ref even with a stale tracking ref', async () => {
+  const { config, remote, repo, git, runGit } = fixture()
+  fs.writeFileSync(config, '{"branch":"main"}')
+  git(remote, 'branch', '-m', 'main', 'retired')
+  await expect(resolveDesktopUpdateBranch(config, repo, runGit)).rejects.toThrow(/main.*missing/)
+})
+
+test('absence is not an enrolled main branch', () => {
+  const { config } = fixture()
+  expect(readDesktopUpdateConfig(config)).toEqual({ branch: 'main', branchExplicit: false })
+  fs.writeFileSync(config, '{"other":"keep"}')
+  expect(readDesktopUpdateConfig(config).branchExplicit).toBe(false)
+  fs.writeFileSync(config, '{"branch":"main"}')
+  expect(readDesktopUpdateConfig(config).branchExplicit).toBe(true)
+  fs.writeFileSync(config, '\ufeff{"branch":"stable"}')
+  expect(readDesktopUpdateConfig(config).branch).toBe('stable')
 })
 
 test('Desktop refuses malformed/unreadable selected-channel configuration', async () => {

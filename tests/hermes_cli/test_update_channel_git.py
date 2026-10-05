@@ -30,13 +30,12 @@ def enrolled_git(tmp_path, monkeypatch):
     channel.write_text('{"branch":"stable"}', encoding="utf-8")
     monkeypatch.setenv("HERMES_DESKTOP_USER_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(main, "PROJECT_ROOT", repo)
+    monkeypatch.setenv("PYTHONPATH", str(repo))
     monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a: "git")
     # Stop at the code-update boundary; no backup, deps, inventory or service work.
     monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda args: None)
     monkeypatch.setattr(main, "_run_pre_update_backup", lambda args: None)
     monkeypatch.setattr(main, "_pause_windows_gateways_for_update", lambda: None)
-    monkeypatch.setattr(main, "_capture_active_lazy_features", lambda: [])
-    monkeypatch.setattr(main, "_capture_active_tool_dependencies", lambda: [])
     stopped = []
     monkeypatch.setattr(update_cmd, "_finish_already_up_to_date", lambda *a, **k: stopped.append(a[1]))
     monkeypatch.setattr(update_cmd, "_apply_pulled_update", lambda *a, **k: stopped.append(a[1]))
@@ -79,3 +78,42 @@ def test_missing_selected_ref_fails_check_and_apply_despite_stale_tracking_ref(e
         assert git(env.repo, "rev-parse", "HEAD") == original
     assert env.channel.read_text(encoding="utf-8") == '{"branch":"stable"}'
     assert env.stopped == []
+
+
+def test_enrolled_main_check_never_uses_upstream(enrolled_git, capsys):
+    from hermes_cli.main import cmd_update
+    env = enrolled_git
+    env.channel.write_text('{"branch":"main"}')
+    upstream = env.repo.parent / "upstream"
+    upstream.mkdir()
+    git(upstream, "init", "-b", "main")
+    git(upstream, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-m", "unrelated upstream")
+    git(env.repo, "remote", "add", "upstream", str(upstream))
+    cmd_update(SimpleNamespace(check=True))
+    assert "Fetching from upstream" not in capsys.readouterr().out
+    assert git(env.repo, "rev-parse", "origin/main") == git(env.remote, "rev-parse", "main")
+
+
+def test_enrolled_main_apply_does_not_sync_an_unreviewed_upstream(enrolled_git, monkeypatch):
+    from hermes_cli import main
+    env = enrolled_git
+    env.channel.write_text('{"branch":"main"}')
+    synced = []
+    monkeypatch.setattr(main, "_sync_with_upstream_if_needed", lambda *a, **kw: synced.append(True))
+    main.cmd_update(SimpleNamespace(yes=True, no_backup=True, no_gateway_restart=True))
+    assert synced == []
+    assert git(env.repo, "rev-parse", "HEAD") == git(env.remote, "rev-parse", "main")
+
+
+def test_enrolled_main_cannot_fall_back_to_official_zip(enrolled_git, monkeypatch):
+    from hermes_cli import update_cmd_zip, update_cmd
+    env = enrolled_git
+    env.channel.write_text('{"branch":"main"}')
+    downloads = []
+    monkeypatch.setattr(update_cmd_zip, "_abort_zip_update_if_dirty_tree", lambda: None)
+    monkeypatch.setattr(update_cmd_zip, "_download_and_swap_zip", lambda *a: downloads.append(a))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda *a: None)
+    with pytest.raises(SystemExit):
+        update_cmd_zip._update_via_zip(SimpleNamespace(branch=None), completion_request={})
+    assert downloads == []

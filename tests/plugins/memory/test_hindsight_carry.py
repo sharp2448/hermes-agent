@@ -13,7 +13,7 @@ import pytest
 from hermes_cli import memory_provider_migration as migration
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.memory import find_provider_dir, load_memory_provider
-from tools import lazy_deps
+import pm
 
 
 @pytest.fixture
@@ -32,8 +32,8 @@ def isolated_home(tmp_path, monkeypatch):
 
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
-    monkeypatch.setattr(lazy_deps, "install_specs", forbidden)
-    monkeypatch.setattr(lazy_deps, "_venv_pip_install", forbidden)
+    monkeypatch.setattr(pm, "sync_venv", forbidden)
+    monkeypatch.setattr("pm.client.sync_venv", forbidden)
     try:
         yield home
     finally:
@@ -116,28 +116,10 @@ def test_local_external_client_appends_each_turn_once(isolated_home, monkeypatch
     from plugins.memory import import_provider_module
 
     settings = _seed_home(isolated_home, "carry-append-bank")
-    # Fail explicitly for missing carry wiring, not for an optional SDK import.
-    assert "memory.hindsight" in lazy_deps.LAZY_DEPS, "bundled client needs its lazy dependency entry"
-    root = Path(__file__).resolve().parents[3]
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    extras = project["project"]["optional-dependencies"]
-    assert "hindsight" in extras, "the opt-in client-only installation extra must remain available"
-    extra = [Requirement(spec) for spec in extras["hindsight"]]
-    assert [req.name for req in extra] == ["hindsight-client"]
-    assert "hermes-agent[hindsight]" not in extras["all"]
-
-    # Exercise the actual setup dependency reader: external mode needs only the client.
-    requests = []
-    with monkeypatch.context() as install_patch:
-        install_patch.setattr(
-            lazy_deps, "install_specs",
-            lambda specs, **kw: requests.extend(specs) or lazy_deps.InstallSpecsResult(ok=True),
-        )
-        _install_dependencies("hindsight", force=True)
-    assert [Requirement(spec).name for spec in requests] == ["hindsight-client"]
-    floor = next(spec.version for spec in extra[0].specifier if spec.operator == "==")
-    for spec in (*requests, *lazy_deps.LAZY_DEPS["memory.hindsight"]):
-        assert floor in Requirement(spec).specifier
+    # Setup prepares the declared client-only extra through PM, not a sidecar install.
+    from hermes_cli.memory_setup import memory_provider_dependency_inputs
+    meta, inputs = memory_provider_dependency_inputs("hindsight")
+    assert inputs == {"extras": ["hindsight"]}
 
     # Stand in only for the external SDK and /version response. The provider's
     # lazy ensure, config loader, queue, writer, serialization and flush are real.
@@ -205,3 +187,91 @@ def test_local_external_client_appends_each_turn_once(isolated_home, monkeypatch
         assert "session:carry-session" in item["tags"]
         shipped.extend(message["content"] for turn in json.loads(item["content"]) for message in turn)
     assert shipped == [text for i in range(7) for text in (f"User: user {i}", f"Assistant: assistant {i}")]
+
+
+def test_real_client_constructs_across_profiles_without_server_packages(isolated_home, monkeypatch):
+    from importlib.metadata import distributions, version
+    from plugins.memory import import_provider_module
+    module = import_provider_module("hindsight")
+    monkeypatch.setattr(module, "_fetch_hindsight_api_version", lambda *a: "0.6.1")
+    installed = {dist.metadata["Name"].lower().replace("_", "-") for dist in distributions()}
+    assert installed.isdisjoint({"hindsight-api-slim", "hindsight-api", "hindsight-all", "hindsight-embed", "pg0-embedded"})
+    assert version("hindsight-client") == "0.6.1"
+    other = isolated_home / "profiles" / "other"
+    for home, bank in ((isolated_home, "sdk-a"), (other, "sdk-b"), (isolated_home, "sdk-a")):
+        _seed_home(home, bank)
+        before = (home / "hindsight" / "config.json").read_bytes()
+        token = set_hermes_home_override(home)
+        try:
+            provider = load_memory_provider("hindsight", register_skills=False)
+            provider.initialize(session_id="sdk-session", hermes_home=str(home), platform="cli")
+            try:
+                client = provider._get_client()
+                assert type(client).__module__.startswith("hindsight_client")
+                assert provider._bank_id == bank
+                assert provider._mode == "local_external"
+            finally:
+                provider.shutdown()
+        finally:
+            reset_hermes_home_override(token)
+        assert (home / "hindsight" / "config.json").read_bytes() == before
+
+
+def test_profile_a_b_a_flushes_bounded_buffers_once_to_own_banks(isolated_home, monkeypatch):
+    import sys
+    from types import ModuleType
+    from plugins.memory import import_provider_module
+    calls = []
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def aretain_batch(self, **kwargs):
+            calls.append(kwargs)
+        async def aclose(self):
+            pass
+    sdk = ModuleType("hindsight_client")
+    sdk.Hindsight = Client
+    monkeypatch.setitem(sys.modules, "hindsight_client", sdk)
+    module = import_provider_module("hindsight")
+    monkeypatch.setattr(module, "_append_capability_cache", {})
+    monkeypatch.setattr(module, "_fetch_hindsight_api_version", lambda *a: "0.6.1")
+    homes = {"a": isolated_home, "b": isolated_home / "profiles" / "other"}
+    providers, originals = {}, {}
+    for name, home in homes.items():
+        _seed_home(home, "bank-" + name)
+        originals[name] = (home / "hindsight" / "config.json").read_bytes()
+    try:
+        for cycle, name in enumerate(("a", "b", "a")):
+            home = homes[name]
+            token = set_hermes_home_override(home)
+            try:
+                if name not in providers:
+                    providers[name] = load_memory_provider("hindsight", register_skills=False)
+                    providers[name].initialize(session_id=name, hermes_home=str(home), platform="cli")
+                provider = providers[name]
+                for turn in range(4):
+                    provider.sync_turn(f"{name}-{cycle}-{turn}", "recorded")
+                    assert len(provider._session_turns) < 3
+                provider.on_session_switch(f"{name}-{cycle}-next")
+                assert provider._session_turns == []
+            finally:
+                reset_hermes_home_override(token)
+    finally:
+        for name, provider in providers.items():
+            token = set_hermes_home_override(homes[name])
+            try:
+                provider.shutdown()
+            finally:
+                reset_hermes_home_override(token)
+    observed = []
+    for call in calls:
+        for item in call["items"]:
+            assert item["update_mode"] == "append"
+            for turn in json.loads(item["content"]):
+                user = turn[0]["content"]
+                observed.append(user)
+                assert call["bank_id"] == "bank-" + user.removeprefix("User: ")[0]
+    expected = [f"User: {name}-{cycle}-{turn}" for cycle, name in enumerate(("a", "b", "a")) for turn in range(4)]
+    assert sorted(observed) == sorted(expected)
+    for name, home in homes.items():
+        assert (home / "hindsight" / "config.json").read_bytes() == originals[name]
